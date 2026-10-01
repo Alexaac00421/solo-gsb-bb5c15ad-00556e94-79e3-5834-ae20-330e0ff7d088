@@ -108,3 +108,36 @@ class TripOut(BaseModel):
     arrival_minute: int
     itinerary: list[LegOut]
     confirmed_at: str
+
+
+# ---- 潮位复核 / 改期 -------------------------------------------------------------
+
+class ViolationOut(BaseModel):
+    leg_index: int = Field(description="首次违规航段在原行程中的序号（0 基）")
+    seg_id: int
+    origin: str
+    destination: str
+    minute: int = Field(description="首次违规的绝对占用分钟")
+    reason: str = Field(description="DEPTH / CLEARANCE / DEPTH_AND_CLEARANCE")
+    tide_level: float
+    depth_required: float
+    depth_available: float
+    depth_ok: bool
+    clearance_required: Optional[float] = None
+    clearance_available: Optional[float] = None
+    clearance_ok: Optional[bool] = None
+
+
+class TripReviewOut(BaseModel):
+    trip_id: int
+    snapshot_revision: int = Field(description="确认快照所据修订号（不被修改）")
+    target_revision: int = Field(description="本次复核所据目标潮位修订号")
+    safe: bool = Field(description="原行程在目标修订下逐分钟复核是否安全")
+    first_violation: Optional[ViolationOut] = None
+    rebooked: bool = Field(description="窗口内是否存在全部航段可通行的改期行程")
+    no_solution: bool = Field(description="窗口内无改期解（此时携带原行程风险）")
+    changed_leg_count: int = Field(description="改期行程相对快照出发分钟变动的航段个数")
+    rebooked_arrival_minute: Optional[int] = None
+    rebooked_total_wait_minutes: Optional[int] = None
+    rebooked_itinerary: list[LegOut] = Field(default_factory=list)
+    original_itinerary: list[LegOut]

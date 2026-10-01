@@ -21,8 +21,10 @@ from .schemas import (
     SegmentOut,
     TideCorrection,
     TripOut,
+    TripReviewOut,
 )
 from .services.planning import find_itinerary
+from .services.rebooking import review_trip
 
 
 @asynccontextmanager
@@ -339,6 +341,29 @@ def get_trip(trip_id: int):
         raise ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
                        {"trip_id": trip_id})
     return _trip_out(dict(row))
+
+
+@app.post("/api/trips/{trip_id}/review", response_model=TripReviewOut, tags=["trips"])
+def review_confirmed_trip(trip_id: int, target_revision: Optional[int] = None):
+    """潮位更正后复核已确认行程快照（只读，不修改快照）。
+
+    按快照中的原占用分钟逐段校验目标潮位修订（缺省取最新修订）下的水深与
+    桥高；不安全时返回首次违规的航段/分钟/原因，并在保持原航段顺序、船舶
+    参数、原起始分钟与规划窗口（允许节点重新等待）前提下给出改期行程：
+    出发分钟变动航段数最少、抵达最早、出发分钟序列字典序最优。窗口内无解
+    时携带原行程风险并置 no_solution=true。
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM confirmed_trips WHERE trip_id = ?", (trip_id,)
+        ).fetchone()
+        if row is None:
+            raise ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
+                           {"trip_id": trip_id})
+        trip = dict(row)
+        trip["itinerary"] = json.loads(trip["itinerary"])
+        result = review_trip(conn, trip, target_revision)
+    return result
 
 
 def _trip_out(d: dict) -> TripOut:
