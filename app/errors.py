@@ -29,6 +29,11 @@ def tide_missing(missing_minutes) -> ApiError:
     )
 
 
+def trip_not_found(trip_id: int) -> ApiError:
+    return ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
+                    {"trip_id": trip_id})
+
+
 def no_itinerary(origin: str, destination: str) -> ApiError:
     return ApiError(
         404,

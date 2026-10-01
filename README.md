@@ -4,7 +4,11 @@
 （正整数分钟航时、静水深度、可选桥底净空）与逐分钟潮位后，给定船舶吃水、水面以上
 高度、安全余量及不超过 1440 分钟的规划窗口，计算**最早抵达**行程；同一抵达时刻按
 **航段编号序列字典序**择优。潮位以**修订号**版本化管理，确认行程时在同一数据库事务
-中复核修订号与行程，过期即冲突且不保存，已确认行程作为不可变快照长期保留。
+中复核修订号与行程，过期即冲突且不保存，已确认行程作为不可变快照长期保留。潮位更正
+后，调度员可凭**已确认行程号 + 目标潮位修订号**复核原航路：按快照原占用分钟逐段校验
+水深与桥高；原行程不安全时，在保持航段编号顺序、船舶参数、原起始分钟与规划窗口不变、
+仅允许节点重新等待的前提下求**改期行程**（变动航段最少 → 抵达最早 → 出发分钟序列
+字典序），窗口内无解则只返回风险与无解标记，**绝不修改已确认快照**。
 
 ---
 
@@ -90,6 +94,20 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
      `409 PLAN_MISMATCH`，**不保存**；
   3. 复核通过后保存**当时的结果快照**（修订号、参数、到达分钟、完整行程 JSON）。
      之后再发生潮位更正不影响已确认行程。
+- **更正后复核 / 改期**（只读，不改写快照）：携带已确认行程号与目标修订号，
+  1. **原航路复核**：按快照中的航段编号顺序与原占用分钟（进入分钟 `d` 占用
+     `d..d+t-1`），依目标修订的逐分钟潮位逐段校验；首分钟违规即判定原行程不安全，
+     返回首次违规的航段（`leg_index`/`seg_id`）、分钟及原因（`depth` 水深不足 /
+     `clearance` 桥高净空不足），并给出该分钟实际/要求的水深与净空；
+  2. **改期**：不安全时启用。**保持**原航段编号顺序、船舶参数（吃水/水面以上
+     高度/余量）、原起始分钟与规划窗口（窗口内占用才合法），**仅允许在节点重新
+     等待**——即各段首尾相接、只调整每段出发分钟。择优依次为：
+     ① 相对快照**出发分钟变动的航段个数**（`changed_leg_count`）最少；
+     ② **抵达分钟最早**；③ 前述均相同，按各段出发分钟序列做字典序（小者优先）；
+  3. 原行程安全时直接返回 `safe=true`（零航段行程恒安全，无需改期）；窗口内无
+     改期解时返回原行程风险加 `no_solution=true`，此时仍可在 `/api/trips` 读到
+     原封不动的快照。缺潮位、未知行程、未知修订沿用 `MISSING_TIDE_DATA` /
+     `TRIP_NOT_FOUND` / `TIDE_REVISION_NOT_FOUND` 既有错误语义。
 
 ### 错误响应格式
 
@@ -100,7 +118,8 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 场景 | HTTP | code |
 | --- | --- | --- |
 | 起点或终点未知 | 404 | `NODE_NOT_FOUND` |
-| 指定潮位修订不存在 | 404 | `TIDE_REVISION_NOT_FOUND` |
+| 指定潮位修订不存在 / 复核时目标修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
+| 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
 | 窗口内有分钟缺潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
 | 窗口内无可行行程 | 404 | `NO_FEASIBLE_ITINERARY` |
 | 参数校验失败（窗口>1440、航时非正等） | 422 | `VALIDATION_ERROR` |
@@ -122,6 +141,7 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/tide/corrections` | 潮位更正，生成新修订 |
 | POST | `/api/trips/plan` | 规划最早抵达行程 |
 | POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核） |
+| POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
 | GET | `/api/trips` | 已确认行程列表 |
 | GET | `/api/trips/{trip_id}` | 已确认行程快照详情 |
 | GET | `/health` | 健康检查 |
@@ -187,6 +207,75 @@ POST /api/trips/confirm
 成功返回 `201`，响应为含 `trip_id / revision / arrival_minute / itinerary / confirmed_at`
 的不可变快照；过期返回 `409 REVISION_STALE`。
 
+### 更正后复核 / 改期请求与响应示例
+
+潮位发生更正后，凭**已确认行程号**与**目标潮位修订号**复核（`target_revision`
+可省略，省略时取最新修订；请求体也可整体省略）：
+
+```json
+POST /api/trips/1/review
+{ "target_revision": 2 }
+```
+
+**原行程安全**：`safe=true`，`first_violation/reschedule` 均为 `null`。
+
+**原行程不安全且窗口内可改期**（下例为演示库中 `A→D`、吃水 6.5/船高 2.0/余量 0.5、
+窗口 720 的已确认行程，第 100 分钟被更正为低潮 0.2m）：
+
+```json
+{
+  "trip_id": 1,
+  "snapshot_revision": 1,
+  "target_revision": 2,
+  "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 720,
+  "draft": 6.5, "height": 2.0, "margin": 0.5,
+  "original_arrival_minute": 144,
+  "safe": false,
+  "first_violation": {
+    "leg_index": 1,
+    "seg_id": 2,
+    "origin": "B", "destination": "C",
+    "minute": 100,
+    "reasons": ["depth"],
+    "tide_level": 0.2,
+    "depth": 4.0,
+    "clearance": 8.0,
+    "required_depth": 7.0,
+    "required_clearance": 2.5,
+    "available_depth": 4.2,
+    "available_clearance": 7.8
+  },
+  "reschedule": {
+    "revision": 2,
+    "arrival_minute": 161,
+    "total_wait_minutes": 71,
+    "changed_leg_count": 2,
+    "changed_legs": [
+      {"leg_index": 1, "seg_id": 2, "original_departure_minute": 84,  "new_departure_minute": 101},
+      {"leg_index": 2, "seg_id": 3, "original_departure_minute": 124, "new_departure_minute": 141}
+    ],
+    "itinerary": [
+      {"seg_id": 1, "origin": "A", "destination": "B", "start_minute": 54,  "end_minute": 84,  "travel_time": 30},
+      {"seg_id": 2, "origin": "B", "destination": "C", "start_minute": 101, "end_minute": 141, "travel_time": 40},
+      {"seg_id": 3, "origin": "C", "destination": "D", "start_minute": 141, "end_minute": 161, "travel_time": 20}
+    ]
+  },
+  "no_solution": false,
+  "original_itinerary": [ /* 快照原行程，逐段原样返回 */ ]
+}
+```
+
+要点：
+
+- 第一段出发分钟仍是快照中的 `54`（**变动航段数最少**优先）；第二、三段因需避开
+  低潮而整体后移，`changed_leg_count=2`，改期抵达 161。
+- `first_violation` 按快照航段顺序、占用分钟递增给出**首次**违规；`reasons` 可能为
+  `["depth"]`、`["clearance"]` 或二者同时出现。
+- **窗口内无改期解**：`reschedule=null` 且 `no_solution=true`，`first_violation`
+  仍给出原行程风险；快照保持不变（`GET /api/trips/{trip_id}` 读到的仍是原内容）。
+- 该接口为**只读**：不新增、不修改任何确认行程，也不产生新修订。
+
 ---
 
 ## 4. 调用示例（curl）
@@ -218,31 +307,44 @@ curl -s -X POST $BASE/api/tide/corrections \
 # 4) 用旧修订号再次确认 -> 409 REVISION_STALE
 curl -i -X POST $BASE/api/trips/confirm \
   -H 'Content-Type: application/json' -d @/tmp/plan.json
+
+# 5) 更正后复核已确认行程（目标修订取最新；first_violation 给首次违规）
+curl -s -X POST $BASE/api/trips/$TID/review \
+  -H 'Content-Type: application/json' -d '{"target_revision":2}'
+# 请求体可省略（默认最新修订）：
+curl -s -X POST $BASE/api/trips/$TID/review
 ```
 
-Python 示例（规划 → 确认 → 模拟过期冲突）：
+Python 示例（规划 → 确认 → 更正 → 复核/改期）：
 
 ```python
 import requests
 
 B = "http://localhost:8000"
-
 plan = requests.post(f"{B}/api/trips/plan", json={
     "origin": "A", "destination": "D",
-    "start_minute": 0, "window_minutes": 1440,
-    "draft": 5.0, "height": 2.0, "margin": 0.5,
+    "start_minute": 0, "window_minutes": 720,
+    "draft": 6.5, "height": 2.0, "margin": 0.5,
 }).json()
-print("依据修订", plan["revision"], "第", plan["arrival_minute"], "分钟抵达")
+trip = requests.post(f"{B}/api/trips/confirm", json=plan).json()
+tid = trip["trip_id"]
+print("已确认行程", tid, "第", trip["arrival_minute"], "分钟抵达")
 
-r = requests.post(f"{B}/api/trips/confirm", json=plan)   # 规划响应即确认请求体
-r.raise_for_status()
-print("已确认行程 trip_id =", r.json()["trip_id"])
-
-# 期间潮位被更正 -> 用旧结果再次确认
+# 潮位更正：第 100 分钟异常低潮
 requests.post(f"{B}/api/tide/corrections", json={"corrections": {100: 0.2}})
-r = requests.post(f"{B}/api/trips/confirm", json=plan)
-assert r.status_code == 409 and r.json()["error"]["code"] == "REVISION_STALE"
-print("过期冲突：", r.json()["error"]["message"])
+
+# 复核原航路并取改期建议（只读，快照不变）
+rv = requests.post(f"{B}/api/trips/{tid}/review", json={}).json()
+if rv["safe"]:
+    print("原行程在最新潮位下仍安全")
+elif rv["no_solution"]:
+    v = rv["first_violation"]
+    print("窗口内无改期解；首次违规：航段", v["seg_id"], "分钟", v["minute"], v["reasons"])
+else:
+    rs = rv["reschedule"]
+    print("改期：变动航段", rs["changed_leg_count"], "个，改至第",
+          rs["arrival_minute"], "分钟抵达")
+    print("新出发分钟：", [l["start_minute"] for l in rs["itinerary"]])
 ```
 
 录入自定义数据：
@@ -272,6 +374,25 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
 故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
 
+### 更正后复核 / 改期（实现见 `app/services/reschedule.py`）
+
+1. 只读取出已确认快照（行程号、快照修订、船舶参数、原起始分钟/窗口、完整行程 JSON），
+   校验目标修订（缺省取最新；未知修订 `TIDE_REVISION_NOT_FOUND`），取全窗口潮位，
+   缺任一分钟报 `MISSING_TIDE_DATA`；未知行程报 `TRIP_NOT_FOUND`。
+2. **原航路复核**：按快照航段顺序遍历每段原占用分钟（`d..d+t-1`），用与规划相同的
+   `_minute_ok` 判定，返回首个违规分钟及其 `depth`/`clearance` 原因。
+3. **改期 DP**：航段序列固定（快照的 k 个 `seg_id`），状态为「完成前 i 段、于某分钟
+   抵达该段终点」，每状态只保留一个最优代价
+   `(相对快照的出发分钟变动段数, 各段出发分钟序列)`（字典序）。第 i 段用「抵达分钟
+   ≤ 当前出发分钟」的逐分钟最优前缀扫描（等待由前缀隐式表达），命中可行进入分钟即
+   追加该段出发分钟；可行表复用规划的不可行分钟前缀和，单次判定 O(1)。
+4. 终态在全部抵达分钟上取 `(变动段数, 抵达分钟, 出发分钟序列)` 字典序最小者；无终态
+   即 `no_solution`。复杂度 O(k·W)，且全程不写库。
+
+剪枝依据：同一 `(i, 抵达分钟)` 上若代价 `(c1, d1) < (c2, d2)`，则追加同一段的同一
+出发分钟后，变动段数同增 0/1、出发序列同追加同一值，字典序关系不变，故每状态只保留
+一个最优代价不会丢失最优解。
+
 ---
 
 ## 6. 项目结构
@@ -280,11 +401,12 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 app/
   config.py             # 环境变量配置
   database.py           # SQLite 连接、建表、演示数据初始化
-  errors.py             # 统一业务错误
+  errors.py             # 统一业务错误（含 trip_not_found 构造器）
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法
-  main.py               # FastAPI 路由（节点/航段/潮位/规划/确认）
-tests/                  # pytest 测试（15 个，含择优、缺潮位、事务冲突等）
+  services/reschedule.py# 更正后原行程复核与改期 DP（只读）
+  main.py               # FastAPI 路由（节点/航段/潮位/规划/确认/复核改期）
+tests/                  # pytest 测试（31 个，含择优、缺潮位、事务冲突、复核改期等）
 Dockerfile
 docker-compose.yml
 requirements.txt

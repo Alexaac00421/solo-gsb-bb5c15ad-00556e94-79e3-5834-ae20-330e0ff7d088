@@ -108,3 +108,74 @@ class TripOut(BaseModel):
     arrival_minute: int
     itinerary: list[LegOut]
     confirmed_at: str
+
+
+# ---- 潮位更正后的复核 / 改期 -------------------------------------------------------
+
+class ReviewRequest(BaseModel):
+    target_revision: Optional[int] = Field(
+        default=None, description="目标潮位修订号；不填取最新修订"
+    )
+
+
+class ViolationOut(BaseModel):
+    leg_index: int = Field(description="首次违规航段在快照行程中的下标（0 起）")
+    seg_id: int
+    origin: str
+    destination: str
+    minute: int = Field(description="首次违规的占用分钟（绝对分钟）")
+    reasons: list[str] = Field(
+        description="违规原因：depth=水深不足，clearance=桥高净空不足，missing_tide=缺潮位"
+    )
+    tide_level: Optional[float] = None
+    depth: float = Field(description="航段静水深度（米）")
+    clearance: Optional[float] = Field(default=None, description="桥底净空（米），无桥为 null")
+    required_depth: float = Field(description="要求的最小可用水深：吃水+余量（米）")
+    required_clearance: float = Field(description="要求的最小净空：水面以上高度+余量（米）")
+    available_depth: Optional[float] = Field(
+        default=None, description="该分钟实际可用水深：静水深度+潮位（米）"
+    )
+    available_clearance: Optional[float] = Field(
+        default=None, description="该分钟实际桥高净空：桥底净空−潮位（米），无桥为 null"
+    )
+
+
+class ChangedLegOut(BaseModel):
+    leg_index: int
+    seg_id: int
+    original_departure_minute: int
+    new_departure_minute: int
+
+
+class RescheduleOut(BaseModel):
+    revision: int = Field(description="改期所据目标修订号")
+    arrival_minute: int
+    total_wait_minutes: int
+    changed_leg_count: int = Field(description="相对快照出发分钟发生变化的航段个数")
+    changed_legs: list[ChangedLegOut]
+    itinerary: list[LegOut]
+
+
+class TripReviewOut(BaseModel):
+    trip_id: int
+    snapshot_revision: int = Field(description="确认快照所据修订号")
+    target_revision: int = Field(description="本次复核所据目标修订号")
+    origin: str
+    destination: str
+    start_minute: int
+    window_minutes: int
+    draft: float
+    height: float
+    margin: float
+    original_arrival_minute: int
+    safe: bool = Field(description="原行程在目标修订下按原占用分钟是否安全")
+    first_violation: Optional[ViolationOut] = Field(
+        default=None, description="不安全时的首次违规航段/分钟/原因"
+    )
+    reschedule: Optional[RescheduleOut] = Field(
+        default=None, description="不安全且窗口内有改期解时的改期行程"
+    )
+    no_solution: bool = Field(
+        default=False, description="不安全且窗口内无改期解时为 true（快照不被修改）"
+    )
+    original_itinerary: list[LegOut]

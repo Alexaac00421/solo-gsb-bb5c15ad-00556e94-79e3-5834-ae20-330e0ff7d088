@@ -16,13 +16,16 @@ from .schemas import (
     NodeIn,
     PlanRequest,
     PlanResponse,
+    ReviewRequest,
     RevisionOut,
     SegmentIn,
     SegmentOut,
     TideCorrection,
     TripOut,
+    TripReviewOut,
 )
 from .services.planning import find_itinerary
+from .services.reschedule import review_and_reschedule
 
 
 @asynccontextmanager
@@ -339,6 +342,24 @@ def get_trip(trip_id: int):
         raise ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
                        {"trip_id": trip_id})
     return _trip_out(dict(row))
+
+
+@app.post(
+    "/api/trips/{trip_id}/review",
+    response_model=TripReviewOut,
+    tags=["trips"],
+)
+def review_trip(trip_id: int, body: Optional[ReviewRequest] = None):
+    """潮位更正后复核已确认行程，并在不安全时求改期行程。
+
+    只读操作：保持快照航段编号顺序、船舶参数、原起始分钟与规划窗口，仅允许
+    在节点重新等待；改期择优为「变动航段数最少 → 抵达最早 → 出发分钟序列
+    字典序最小」。窗口内无解时返回原行程风险与 no_solution，不修改快照。
+    """
+    target_revision = body.target_revision if body is not None else None
+    with get_conn() as conn:
+        result = review_and_reschedule(conn, trip_id, target_revision)
+    return result
 
 
 def _trip_out(d: dict) -> TripOut:
